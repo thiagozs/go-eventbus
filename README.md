@@ -17,7 +17,7 @@ Uma biblioteca leve e eficiente para orquestração de eventos assíncronos em G
 ## Instalação
 
 ```bash
-go get github.com/seu-usuario/eventbus
+go get github.com/thiagozs/go-eventbus
 ```
 
 ## Uso Básico
