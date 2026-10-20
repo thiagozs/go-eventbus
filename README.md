@@ -6,15 +6,17 @@ Uma biblioteca leve e eficiente para orquestração de eventos assíncronos em G
 
 - ✅ **Type-Safe com Generics** - Zero type assertions, compile-time safety!
 - ✅ **Worker Pool** - Pool configurável de goroutines para processar eventos
-- ✅ **Event Queue** - Fila interna com buffer usando channels nativos do Go
+- ✅ **Event Queue** - Fila interna limitada, ordenada por prioridade (heap)
 - ✅ **Retry Logic** - Reprocessamento automático em caso de falha
 - ✅ **Dead Letter Queue (DLQ)** - Eventos que falharam após todas as tentativas
-- ✅ **Priority Events** - Suporte para eventos com prioridade
+- ✅ **Priority Events** - Maior prioridade é processada primeiro, FIFO entre prioridades iguais
 - ✅ **Graceful Shutdown** - Encerramento seguro aguardando processar eventos pendentes
 - ✅ **Thread-Safe** - Totalmente seguro para uso concorrente
 - ✅ **Context Support** - Timeout e cancelamento via context
 
 ## Instalação
+
+Requer Go 1.27.0 ou superior.
 
 ```bash
 go get github.com/thiagozs/go-eventbus
@@ -77,9 +79,10 @@ type Config struct {
     Retries       int           // Tentativas extras após falha (default: 3)
                                  // Total = 1 inicial + Retries
                                  // Retries < 0 desativa os retries; 0 usa o default (3)
-// Ex: Retries=3 → 4 tentativas no total
+                                 // Ex: Retries=3 → 4 tentativas no total
     DLQSize       int           // Tamanho da DLQ (default: 50)
-    WorkerTimeout time.Duration // Timeout por evento (default: 30s)
+    WorkerTimeout time.Duration // Timeout por tentativa (default: 30s)
+    Logger        *slog.Logger  // Logger (default: slog.Default())
 }
 ```
 
@@ -125,6 +128,18 @@ EmailData{To: "user@example.com"})
 // Evento urgente (prioridade alta)
 eventbus.PublishWithPriority(bus, "alert.critical",
 AlertData{Level: "CRITICAL"}, 10)
+```
+
+Eventos pendentes na fila são ordenados por prioridade; com prioridades
+iguais vale a ordem de publicação.
+
+### Cancelando uma inscrição
+
+```go
+unsubscribe := eventbus.Subscribe(bus, "order.created", sendEmailHandler)
+
+// Remove o handler quando não for mais necessário
+unsubscribe()
 ```
 
 ### Múltiplos Handlers
