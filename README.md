@@ -76,7 +76,8 @@ type Config struct {
     QueueSize     int           // Tamanho do buffer (default: 100)
     Retries       int           // Tentativas extras após falha (default: 3)
                                  // Total = 1 inicial + Retries
-                                 // Ex: Retries=3 → 4 tentativas no total
+                                 // Retries < 0 desativa os retries; 0 usa o default (3)
+// Ex: Retries=3 → 4 tentativas no total
     DLQSize       int           // Tamanho da DLQ (default: 50)
     WorkerTimeout time.Duration // Timeout por evento (default: 30s)
 }
@@ -142,9 +143,9 @@ eventbus.Subscribe(bus, "order.created", notifyWarehouseHandler)
 ```go
 go func() {
     dlq := bus.GetDLQ()
-    for wrapper := range dlq {
-        dlqEvent := eventbus.GetDLQEvent(wrapper)
-        log.Printf("Evento falhou: %s - %+v", dlqEvent.Type, dlqEvent.Payload)
+    for ev := range dlq {
+        log.Printf("Evento falhou após %d tentativas: %s - %+v (%v)",
+            ev.Attempts, ev.Type, ev.Payload, ev.Err)
         // Aqui você pode: salvar em DB, enviar alerta, etc
     }
 }()
@@ -204,20 +205,21 @@ fmt.Printf("Queue: %v/%v\n", stats["queue_size"], config.QueueSize)
 
 ## Tratamento de Erros
 
-1. **Handler falha** → Retry com backoff exponencial
+1. **Handler falha** → Retry com backoff linear (só o handler que falhou e os seguintes são reexecutados)
    - Tentativa inicial (imediata)
    - Retry 1: aguarda 1s
    - Retry 2: aguarda 2s
    - Retry N: aguarda Ns
 2. **Após todas tentativas** → Envia para DLQ
-3. **DLQ cheia** → Log de erro (evento é perdido)
+3. **DLQ cheia** → Log de erro via `slog` (evento é perdido)
 
 **Exemplo:** Com `Retries: 3`, cada evento terá **4 tentativas totais** (1 inicial + 3 retries).
 
 ## Shutdown Graceful
 
 ```go
-// Aguarda até 10s para processar eventos pendentes
+// Para de aceitar eventos, processa os pendentes e aguarda até 10s;
+// se estourar, cancela os handlers em execução
 if err := bus.Shutdown(10 * time.Second); err != nil {
     log.Fatal("Timeout no shutdown!")
 }

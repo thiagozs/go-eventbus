@@ -142,8 +142,7 @@ func handlePayment(ctx context.Context,
 // Monitor para Dead Letter Queue
 func monitorDLQ(bus *eventbus.EventBus) {
 	dlq := bus.GetDLQ()
-	for wrapper := range dlq {
-		dlqEvent := eventbus.GetDLQEvent(wrapper)
+	for dlqEvent := range dlq {
 		fmt.Printf("⚠️  [DLQ] Evento falhou: %s - %+v\n",
 			dlqEvent.Type, dlqEvent.Payload)
 	}

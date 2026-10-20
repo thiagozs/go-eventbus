@@ -167,8 +167,7 @@ func TestDeadLetterQueue(t *testing.T) {
 	// Monitora DLQ
 	go func() {
 		dlq := bus.GetDLQ()
-		wrapper := <-dlq
-		dlqEvent := GetDLQEvent(wrapper)
+		dlqEvent := <-dlq
 		if dlqEvent.Type != "dlq.event" {
 			t.Errorf("Esperado evento 'dlq.event' na DLQ, got '%s'", dlqEvent.Type)
 		}
@@ -219,6 +218,121 @@ func TestPriorityEvents(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestPriorityOrdering(t *testing.T) {
+	bus := NewEventBus(Config{Workers: 1, QueueSize: 10})
+	defer bus.Shutdown(2 * time.Second)
+
+	block := make(chan struct{})
+	var mu sync.Mutex
+	var order []int
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	Subscribe(bus, "p", func(ctx context.Context, e Event[int]) error {
+		defer wg.Done()
+		if e.Payload == 0 {
+			<-block // segura o único worker até a queue ser preenchida
+			return nil
+		}
+		mu.Lock()
+		order = append(order, e.Payload)
+		mu.Unlock()
+		return nil
+	})
+
+	Publish(bus, "p", 0)
+	time.Sleep(50 * time.Millisecond)
+	PublishWithPriority(bus, "p", 1, 1)
+	PublishWithPriority(bus, "p", 2, 5)
+	PublishWithPriority(bus, "p", 3, 5)
+	close(block)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 3 || order[0] != 2 || order[1] != 3 || order[2] != 1 {
+		t.Errorf("ordem esperada [2 3 1], got %v", order)
+	}
+}
+
+func TestUnsubscribe(t *testing.T) {
+	bus := NewEventBus(Config{Workers: 1, Retries: -1})
+	defer bus.Shutdown(2 * time.Second)
+
+	unsub := Subscribe(bus, "u", func(ctx context.Context, e Event[int]) error { return nil })
+	unsub()
+
+	if got := bus.Stats()["handlers_registrados"]; got != 0 {
+		t.Errorf("esperado 0 handlers, got %v", got)
+	}
+}
+
+func TestRetryResumesFailedHandler(t *testing.T) {
+	bus := NewEventBus(Config{Workers: 1, Retries: 1})
+	defer bus.Shutdown(5 * time.Second)
+
+	var first, second int
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	Subscribe(bus, "r", func(ctx context.Context, e Event[int]) error {
+		mu.Lock()
+		first++
+		mu.Unlock()
+		return nil
+	})
+	Subscribe(bus, "r", func(ctx context.Context, e Event[int]) error {
+		mu.Lock()
+		defer mu.Unlock()
+		second++
+		if second == 1 {
+			return errors.New("falha transitória")
+		}
+		close(done)
+		return nil
+	})
+
+	Publish(bus, "r", 1)
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if first != 1 || second != 2 {
+		t.Errorf("esperado first=1 second=2, got first=%d second=%d", first, second)
+	}
+}
+
+func TestPublishAfterShutdown(t *testing.T) {
+	bus := NewEventBus(Config{Workers: 1})
+	bus.Shutdown(time.Second)
+	if err := Publish(bus, "x", 1); err == nil {
+		t.Error("esperado erro ao publicar após shutdown")
+	}
+}
+
+func TestShutdownDrainsQueue(t *testing.T) {
+	bus := NewEventBus(Config{Workers: 1, QueueSize: 10})
+	var mu sync.Mutex
+	n := 0
+	Subscribe(bus, "d", func(ctx context.Context, e Event[int]) error {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		return nil
+	})
+	for i := 0; i < 5; i++ {
+		Publish(bus, "d", i)
+	}
+	if err := bus.Shutdown(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 5 {
+		t.Errorf("esperado 5 eventos processados, got %d", n)
+	}
 }
 
 func TestStats(t *testing.T) {
