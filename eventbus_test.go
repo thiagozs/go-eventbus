@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -460,4 +461,40 @@ func BenchmarkConcurrentPublish(b *testing.B) {
 			i++
 		}
 	})
+}
+
+func TestDLQFullNotifiesDrop(t *testing.T) {
+	var dropped atomic.Int32
+	bus := NewEventBus(Config{
+		Workers: 1, Retries: -1, DLQSize: 1,
+		OnDLQDrop: func(DLQEvent) { dropped.Add(1) },
+	})
+	Subscribe(bus, "fail", func(ctx context.Context, e Event[int]) error { return errors.New("x") })
+	for i := 0; i < 3; i++ {
+		Publish(bus, "fail", i)
+	}
+	if err := bus.Shutdown(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if dropped.Load() != 2 || bus.Stats()["dlq_dropped"].(uint64) != 2 {
+		t.Fatalf("esperava 2 descartes, callback=%d stats=%v", dropped.Load(), bus.Stats()["dlq_dropped"])
+	}
+}
+
+func TestDLQDisabledNotifiesFailure(t *testing.T) {
+	var failed atomic.Int32
+	bus := NewEventBus(Config{
+		Workers: 1, Retries: -1, DLQSize: -1,
+		OnFailure: func(DLQEvent) { failed.Add(1) },
+	})
+	Subscribe(bus, "fail", func(ctx context.Context, e Event[int]) error { return errors.New("x") })
+	for i := 0; i < 3; i++ {
+		Publish(bus, "fail", i)
+	}
+	if err := bus.Shutdown(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if bus.GetDLQ() != nil || failed.Load() != 3 || bus.Stats()["dlq_dropped"].(uint64) != 0 {
+		t.Fatalf("falhas=%d dlq=%v dropped=%v", failed.Load(), bus.GetDLQ(), bus.Stats()["dlq_dropped"])
+	}
 }

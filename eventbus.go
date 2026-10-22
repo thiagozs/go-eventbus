@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,24 +74,33 @@ type EventBus struct {
 	closed   bool
 	seq      uint64
 
-	workers int
-	wg      sync.WaitGroup
-	ctx     context.Context
-	cancel  context.CancelFunc
-	retries int
-	timeout time.Duration
-	dlq     chan DLQEvent // Dead Letter Queue
-	log     *slog.Logger
+	workers    int
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
+	retries    int
+	timeout    time.Duration
+	backoff    time.Duration
+	maxBackoff time.Duration
+	dlqDropped atomic.Uint64
+	onDLQDrop  func(DLQEvent)
+	onFailure  func(DLQEvent)
+	dlq        chan DLQEvent // Dead Letter Queue
+	log        *slog.Logger
 }
 
 // Config para configurar o EventBus
 type Config struct {
-	Workers       int           // Número de workers no pool (default: 10)
-	QueueSize     int           // Capacidade da queue (default: 100)
-	Retries       int           // Retries extras após falha (default: 3; valor negativo desativa)
-	DLQSize       int           // Tamanho da Dead Letter Queue (default: 50)
-	WorkerTimeout time.Duration // Timeout por tentativa de processamento (default: 30s)
-	Logger        *slog.Logger  // Logger (default: slog.Default())
+	Workers       int            // Número de workers no pool (default: 10)
+	QueueSize     int            // Capacidade da queue (default: 100)
+	Retries       int            // Retries extras após falha (default: 3; valor negativo desativa)
+	DLQSize       int            // Tamanho da Dead Letter Queue (default: 50; valor negativo desativa)
+	WorkerTimeout time.Duration  // Timeout por tentativa de processamento (default: 30s)
+	RetryBackoff  time.Duration  // Base do backoff linear entre tentativas (default: 1s)
+	MaxBackoff    time.Duration  // Teto do backoff, antes do jitter (default: 30s)
+	OnDLQDrop     func(DLQEvent) // Chamado quando a DLQ está cheia e o evento é descartado (opcional)
+	OnFailure     func(DLQEvent) // Chamado quando um evento esgota as tentativas, com ou sem DLQ (opcional)
+	Logger        *slog.Logger   // Logger (default: slog.Default())
 }
 
 // NewEventBus cria uma nova instância do EventBus
@@ -105,11 +116,17 @@ func NewEventBus(config Config) *EventBus {
 	} else if config.Retries < 0 {
 		config.Retries = 0
 	}
-	if config.DLQSize <= 0 {
+	if config.DLQSize == 0 {
 		config.DLQSize = 50
 	}
 	if config.WorkerTimeout <= 0 {
 		config.WorkerTimeout = 30 * time.Second
+	}
+	if config.RetryBackoff <= 0 {
+		config.RetryBackoff = time.Second
+	}
+	if config.MaxBackoff <= 0 {
+		config.MaxBackoff = 30 * time.Second
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -118,15 +135,21 @@ func NewEventBus(config Config) *EventBus {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	bus := &EventBus{
-		handlers: make(map[string][]handlerEntry),
-		capacity: config.QueueSize,
-		workers:  config.Workers,
-		ctx:      ctx,
-		cancel:   cancel,
-		retries:  config.Retries,
-		timeout:  config.WorkerTimeout,
-		dlq:      make(chan DLQEvent, config.DLQSize),
-		log:      config.Logger,
+		handlers:   make(map[string][]handlerEntry),
+		capacity:   config.QueueSize,
+		workers:    config.Workers,
+		ctx:        ctx,
+		cancel:     cancel,
+		retries:    config.Retries,
+		timeout:    config.WorkerTimeout,
+		backoff:    config.RetryBackoff,
+		maxBackoff: config.MaxBackoff,
+		onDLQDrop:  config.OnDLQDrop,
+		onFailure:  config.OnFailure,
+		log:        config.Logger,
+	}
+	if config.DLQSize > 0 {
+		bus.dlq = make(chan DLQEvent, config.DLQSize)
 	}
 	bus.qcond = sync.NewCond(&bus.qmu)
 
@@ -279,6 +302,16 @@ func (eb *EventBus) dispatch(ctx context.Context, w *eventWrapper) error {
 	return nil
 }
 
+// retryDelay calcula o atraso antes da próxima tentativa: backoff linear
+// limitado a maxBackoff, com jitter de até 20% para evitar thundering herd.
+func (eb *EventBus) retryDelay(attempt int) time.Duration {
+	d := time.Duration(attempt+1) * eb.backoff
+	if d > eb.maxBackoff || d <= 0 {
+		d = eb.maxBackoff
+	}
+	return d - time.Duration(rand.Int64N(int64(d)/5+1))
+}
+
 // processEventWrapper processa um evento com retry e backoff linear
 func (eb *EventBus) processEventWrapper(wrapper eventWrapper) {
 	var err error
@@ -301,24 +334,36 @@ func (eb *EventBus) processEventWrapper(wrapper eventWrapper) {
 
 		// Backoff interrompido pelo shutdown forçado
 		select {
-		case <-time.After(time.Duration(attempt+1) * time.Second):
+		case <-time.After(eb.retryDelay(attempt)):
 		case <-eb.ctx.Done():
 			return
 		}
 	}
 
 	// Envia para DLQ se todas as tentativas falharam
-	select {
-	case eb.dlq <- DLQEvent{
+	ev := DLQEvent{
 		Type:      wrapper.eventType,
 		Payload:   wrapper.payload,
 		Timestamp: wrapper.timestamp,
 		Err:       err,
 		Attempts:  eb.retries + 1,
-	}:
+	}
+	if eb.onFailure != nil {
+		eb.onFailure(ev)
+	}
+	if eb.dlq == nil {
+		eb.log.Warn("evento falhou (DLQ desativada)", "type", wrapper.eventType, "error", err)
+		return
+	}
+	select {
+	case eb.dlq <- ev:
 		eb.log.Warn("evento enviado para a DLQ", "type", wrapper.eventType)
 	default:
+		eb.dlqDropped.Add(1)
 		eb.log.Error("DLQ cheia, evento perdido", "type", wrapper.eventType)
+		if eb.onDLQDrop != nil {
+			eb.onDLQDrop(ev)
+		}
 	}
 }
 
@@ -331,7 +376,8 @@ type DLQEvent struct {
 	Attempts  int   // total de tentativas realizadas
 }
 
-// GetDLQ retorna o canal da Dead Letter Queue (somente leitura)
+// GetDLQ retorna o canal da Dead Letter Queue (somente leitura);
+// é nil quando a DLQ está desativada (DLQSize negativo)
 func (eb *EventBus) GetDLQ() <-chan DLQEvent {
 	return eb.dlq
 }
@@ -386,6 +432,7 @@ func (eb *EventBus) Stats() map[string]any {
 		"eventos_tipos":        typesCount,
 		"queue_size":           queueSize,
 		"dlq_size":             len(eb.dlq),
+		"dlq_dropped":          eb.dlqDropped.Load(),
 		"workers":              eb.workers,
 	}
 }

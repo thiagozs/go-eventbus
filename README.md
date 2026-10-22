@@ -82,6 +82,10 @@ type Config struct {
                                  // Ex: Retries=3 → 4 tentativas no total
     DLQSize       int           // Tamanho da DLQ (default: 50)
     WorkerTimeout time.Duration // Timeout por tentativa (default: 30s)
+    RetryBackoff  time.Duration // Base do backoff linear (default: 1s)
+    MaxBackoff    time.Duration // Teto do backoff, antes do jitter de até 20% (default: 30s)
+    OnDLQDrop     func(DLQEvent) // Chamado quando a DLQ está cheia (opcional)
+    OnFailure     func(DLQEvent) // Chamado quando o evento esgota as tentativas, com ou sem DLQ (opcional)
     Logger        *slog.Logger  // Logger (default: slog.Default())
 }
 ```
@@ -220,13 +224,13 @@ fmt.Printf("Queue: %v/%v\n", stats["queue_size"], config.QueueSize)
 
 ## Tratamento de Erros
 
-1. **Handler falha** → Retry com backoff linear (só o handler que falhou e os seguintes são reexecutados)
+1. **Handler falha** → Retry com backoff linear configurável, com teto e jitter (só o handler que falhou e os seguintes são reexecutados)
    - Tentativa inicial (imediata)
    - Retry 1: aguarda 1s
    - Retry 2: aguarda 2s
    - Retry N: aguarda Ns
-2. **Após todas tentativas** → Envia para DLQ
-3. **DLQ cheia** → Log de erro via `slog` (evento é perdido)
+2. **Após todas tentativas** → Chama `OnFailure` (se definido) e envia para DLQ (`DLQSize` negativo desativa a DLQ; `GetDLQ()` retorna `nil`)
+3. **DLQ cheia** → Log de erro via `slog`, `OnDLQDrop` é chamado e `Stats()["dlq_dropped"]` é incrementado (evento é perdido)
 
 **Exemplo:** Com `Retries: 3`, cada evento terá **4 tentativas totais** (1 inicial + 3 retries).
 
